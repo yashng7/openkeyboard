@@ -1,0 +1,25 @@
+{
+  "name": "openkeyboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-based WebHID control panel for mechanical & Hall-effect gaming keyboards — remap keys, tune Rapid Trigger & SOCD, paint per-key RGB, and run Jev-powered hardware diagnostics without installing bloatware drivers.",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "dev": "next dev --port ${PORT:-3001}",
+    "build": "next build",
+    "start": "next start --port ${PORT:-3001}",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.7.2"
+  }
+}
