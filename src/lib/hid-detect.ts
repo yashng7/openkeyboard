@@ -5,7 +5,8 @@ import {
   HidInterfaceKind,
   ViaProbeResult,
 } from '@/types/keyboard';
-import { WebHidDevice, WebHidCollection, WebHidInputReportEvent } from '@/lib/webhid-engine';
+import { WebHidDevice, WebHidCollection } from '@/lib/webhid-engine';
+import { ViaTransport } from '@/lib/via-protocol';
 
 // ---------------------------------------------------------------------------
 // WebHID usage constants
@@ -20,18 +21,6 @@ const USAGE_MOUSE = 0x02;
 const USAGE_KEYPAD = 0x07;
 const USAGE_CONSUMER_CONTROL = 0x01;
 const USAGE_VIA_RAW = 0x61;
-
-/**
- * VIA / QMK raw HID command IDs (quantum/via.h, `enum via_command_id`).
- * The board echoes the command ID back in byte 0 of the reply.
- */
-export const VIA_CMD_GET_PROTOCOL_VERSION = 0x01;
-export const VIA_CMD_GET_KEYBOARD_VALUE = 0x02;
-export const VIA_VALUE_FIRMWARE_VERSION = 0x04;
-export const VIA_CMD_DYNAMIC_KEYMAP_GET_LAYER_COUNT = 0x11;
-
-/** VIA raw HID uses fixed 32-byte reports. */
-const VIA_REPORT_LENGTH = 32;
 
 // ---------------------------------------------------------------------------
 // Interface classification
@@ -374,120 +363,29 @@ export function subscribeToHidHotplug(onChange: (kind: 'connect' | 'disconnect')
 // ---------------------------------------------------------------------------
 
 /**
- * Real request/response against a VIA/QMK raw HID interface.
- * Returns null when the device exposes no configurable vendor interface.
- */
-export async function openConfigInterface(device: WebHidDevice): Promise<WebHidDevice | null> {
-  if (!device.opened) await device.open();
-  return device;
-}
-
-function viaOutputReportId(device: WebHidDevice): number {
-  const collections = device.collections ?? [];
-  // Prefer the VIA raw HID collection, then any collection with a declared report.
-  const viaCollection = collections.find((c) => c.usagePage === USAGE_PAGE_VIA_RAW_HID && c.usage === USAGE_VIA_RAW);
-  const fromVia = pickOutputReportId(viaCollection ? [viaCollection] : []);
-  if (viaCollection?.outputReports?.length) return fromVia;
-  return pickOutputReportId(collections);
-}
-
-/** Sends one 32-byte command and waits for the matching reply report. */
-function viaRequest(
-  device: WebHidDevice,
-  reportId: number,
-  payload: Uint8Array,
-  expectCommand: number,
-  timeoutMs: number
-): Promise<DataView | null> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value: DataView | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      device.removeEventListener?.('inputreport', onReport);
-      resolve(value);
-    };
-
-    const onReport = (event: unknown) => {
-      const e = event as WebHidInputReportEvent;
-      // The board echoes the command ID in byte 0 of the reply.
-      if (e?.data && e.data.byteLength > 0 && e.data.getUint8(0) === expectCommand) {
-        finish(e.data);
-      }
-    };
-
-    const timer = setTimeout(() => finish(null), timeoutMs);
-    device.addEventListener('inputreport', onReport);
-
-    const data = new Uint8Array(VIA_REPORT_LENGTH);
-    data.set(payload.subarray(0, VIA_REPORT_LENGTH));
-
-    // Some vendor interfaces only answer on feature reports; try output then feature.
-    device
-      .sendReport(reportId, data)
-      .catch(() => device.sendFeatureReport(reportId, data))
-      .catch(() => finish(null));
-  });
-}
-
-/**
  * Asks a real board for its VIA protocol version, firmware version and layer
- * count. A non-null `responded: true` means a genuine keyboard answered.
+ * count. A `responded: true` result means a genuine keyboard answered.
+ *
+ * Framing lives in `via-protocol.ts` — this is a thin adapter that keeps the
+ * detection layer free of transport details.
  */
 export async function probeViaBoard(device: WebHidDevice, timeoutMs = 800): Promise<ViaProbeResult> {
-  const reportId = viaOutputReportId(device);
+  const transport = new ViaTransport(device, { timeoutMs });
 
-  const versionReply = await viaRequest(
-    device,
-    reportId,
-    Uint8Array.from([VIA_CMD_GET_PROTOCOL_VERSION]),
-    VIA_CMD_GET_PROTOCOL_VERSION,
-    timeoutMs
-  );
+  try {
+    if (!device.opened) await device.open();
+    const caps = await transport.getCapabilities();
 
-  if (!versionReply) {
     return {
-      responded: false,
-      protocolMajor: null,
-      protocolMinor: null,
-      firmwareVersion: null,
-      layerCount: null,
-      error: 'No reply. The interface may not be VIA/QMK, or the board needs its vendor software.',
+      responded: caps.responded,
+      protocolMajor: caps.protocolMajor,
+      protocolMinor: caps.protocolMinor,
+      firmwareVersion: caps.firmwareVersion,
+      layerCount: caps.layerCount,
+      lightingChannel: caps.lightingChannel,
+      error: caps.error,
     };
+  } finally {
+    transport.dispose();
   }
-
-  const protocolMajor = versionReply.getUint8(1);
-  const protocolMinor = versionReply.getUint8(2);
-
-  const firmwareReply = await viaRequest(
-    device,
-    reportId,
-    Uint8Array.from([VIA_CMD_GET_KEYBOARD_VALUE, VIA_VALUE_FIRMWARE_VERSION]),
-    VIA_CMD_GET_KEYBOARD_VALUE,
-    timeoutMs
-  );
-
-  const layersReply = await viaRequest(
-    device,
-    reportId,
-    Uint8Array.from([VIA_CMD_DYNAMIC_KEYMAP_GET_LAYER_COUNT]),
-    VIA_CMD_DYNAMIC_KEYMAP_GET_LAYER_COUNT,
-    timeoutMs
-  );
-
-  const firmwareVersion = firmwareReply
-    ? (firmwareReply.getUint8(2) << 24) |
-      (firmwareReply.getUint8(3) << 16) |
-      (firmwareReply.getUint8(4) << 8) |
-      firmwareReply.getUint8(5)
-    : null;
-
-  return {
-    responded: true,
-    protocolMajor,
-    protocolMinor,
-    firmwareVersion: firmwareVersion !== null ? (firmwareVersion >>> 0) : null,
-    layerCount: layersReply ? layersReply.getUint8(1) : null,
-  };
 }

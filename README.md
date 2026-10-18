@@ -45,6 +45,30 @@ devices the user has explicitly granted it. OpenKeyboard therefore:
 A board that exposes no vendor interface is reported as **read-only** rather
 than pretending settings were applied.
 
+## Writing to hardware
+
+OpenKeyboard separates *staging* from *writing*:
+
+- Edits are staged in the workspace and mirror to `localStorage`, so profiles
+  survive a reload without touching the board.
+- **Write to Board** appears only when the active device answered the VIA
+  handshake. It then speaks the real VIA protocol (`sendReport(0, …)`, 32-byte
+  reports, command echoed in byte 0) through `src/lib/via-protocol.ts`.
+- Lighting is written for real: brightness (`value 1`), effect speed (`value 3`)
+  and colour (`value 4`, hue/sat/val) on whichever channel the board answers
+  (RGB Matrix → RGBLight → backlight → LED Matrix), followed by
+  `id_custom_save` and a read-back that verifies the values landed.
+- The *effect* selection is skipped unless an explicit board effect index is
+  supplied, because effect IDs are firmware-specific. The UI says so instead of
+  guessing.
+- When no writable board is connected the button reads **Save to Browser** and
+  the app never claims a hardware write.
+
+Keycode writes (`id_dynamic_keymap_set_keycode`) and analog actuation tuning are
+not wired to the UI yet. Keycodes need matrix row/column coordinates from the
+board's VIA definition, which is no longer publicly hosted; writing them by
+guess would risk remapping the wrong physical key.
+
 ## Development
 
 ```bash
@@ -52,4 +76,6 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000` in Chrome, Edge, or Brave.
+`npm run dev` serves on `http://localhost:3001` (override with `PORT`). Open it
+in Chrome, Edge, Brave or Opera — WebHID requires a secure context, which
+`localhost` provides.

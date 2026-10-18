@@ -170,6 +170,8 @@ export interface ViaProbeResult {
   protocolMinor: number | null;
   firmwareVersion: number | null;
   layerCount: number | null;
+  /** VIA lighting channel the board answered on, or null when it has no RGB. */
+  lightingChannel: number | null;
   error?: string;
 }
 

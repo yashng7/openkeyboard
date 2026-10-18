@@ -9,6 +9,7 @@ export function PendingBar() {
     hasUnsavedChanges,
     commitPendingChangesToBoard,
     discardPendingChanges,
+    writableBoardConnected,
     toastMessage,
   } = useKeyboard();
 
@@ -18,7 +19,11 @@ export function PendingBar() {
         <div className="pending-bar" role="status" aria-live="polite">
           <div className="pending-bar-text">
             <span className="pending-pulse" />
-            <span>Uncommitted changes staged in workspace buffer — flash to keyboard EEPROM?</span>
+            <span>
+              {writableBoardConnected
+                ? 'Uncommitted changes staged — write them to the connected board?'
+                : 'Uncommitted changes staged — no writable VIA board connected, so saving stores them in this browser only.'}
+            </span>
           </div>
           <div className="pending-bar-actions">
             <button type="button" className="btn-secondary" onClick={discardPendingChanges}>
@@ -27,7 +32,7 @@ export function PendingBar() {
             </button>
             <button type="button" className="btn-primary" onClick={commitPendingChangesToBoard}>
               <Save size={14} />
-              <span>Flash to Board</span>
+              <span>{writableBoardConnected ? 'Write to Board' : 'Save to Browser'}</span>
             </button>
           </div>
         </div>

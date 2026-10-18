@@ -38,6 +38,8 @@ import {
   requestInterfaces,
   subscribeToHidHotplug,
 } from '@/lib/hid-detect';
+import { ViaTransport } from '@/lib/via-protocol';
+import { pushLighting, summariseLightingReport } from '@/lib/via-lighting';
 import { playSwitchSound } from '@/lib/sound-engine';
 
 export interface ChatterEvent {
@@ -69,6 +71,8 @@ interface KeyboardContextValue {
   rescanKeyboards: () => Promise<void>;
   /** Opens the config interface of a detected board and probes it. */
   useDetectedKeyboard: (keyboardId: string) => Promise<void>;
+  /** True when the active device answered VIA and can be written to. */
+  writableBoardConnected: boolean;
   packetLogs: HidPacketLog[];
   clearPacketLogs: () => void;
 
@@ -190,7 +194,6 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
 
   const [webHidSupported, setWebHidSupported] = useState(false);
   const [device, setDevice] = useState<ConnectedDeviceInfo>(SIMULATOR_DEVICES[1]); // Default Keychron Q1 HE 75%
-  const rawHidRef = useRef<WebHidDevice | null>(null);
   const [packetLogs, setPacketLogs] = useState<HidPacketLog[]>([]);
   const [detectedKeyboards, setDetectedKeyboards] = useState<DetectedKeyboard[]>([]);
   const [detecting, setDetecting] = useState(false);
@@ -274,9 +277,35 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const appendPacket = useCallback(async (commandName: string, opcode: number, bytes: number[]) => {
-    const pkt = await dispatchHidPacket(rawHidRef.current, commandName, opcode, bytes);
+    // Staging preview only: never push the synthetic framing to real hardware.
+    const pkt = await dispatchHidPacket(null, commandName, opcode, bytes);
     setPacketLogs((prev) => [pkt, ...prev.slice(0, 49)]);
   }, []);
+
+  /** Logs genuine VIA traffic observed on the wire. */
+  const logBoardFrame = useCallback(
+    (direction: 'OUT' | 'IN', command: number, bytes: Uint8Array | null) => {
+      const now = new Date();
+      const timestamp = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
+      const hex = Array.from(bytes ?? [])
+        .slice(0, 12)
+        .map((b) => b.toString(16).padStart(2, '0').toUpperCase())
+        .join(' ');
+      setPacketLogs((prev) => [
+        {
+          id: `via-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp,
+          direction,
+          commandName: `VIA_0x${command.toString(16).padStart(2, '0').toUpperCase()}`,
+          reportId: 0,
+          hexBytes: hex || '—',
+          status: 'confirmed',
+        },
+        ...prev.slice(0, 49),
+      ]);
+    },
+    []
+  );
 
   const clearPacketLogs = useCallback(() => {
     setPacketLogs([]);
@@ -359,6 +388,7 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
 
   // Map of keyboardId -> raw HID interfaces, needed to open the config collection later.
   const hidInterfacesRef = useRef<Map<string, WebHidDevice[]>>(new Map());
+  const viaTransportRef = useRef<ViaTransport | null>(null);
 
   const rememberInterfaces = useCallback((interfaces: WebHidDevice[]) => {
     const map = new Map<string, WebHidDevice[]>();
@@ -378,7 +408,8 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
       const configDevice = findConfigDevice(interfaces);
 
       if (!configDevice) {
-        rawHidRef.current = null;
+        viaTransportRef.current?.dispose();
+        viaTransportRef.current = null;
         setDevice(buildConnectedDeviceInfo(keyboard, null));
         showToast(
           `${keyboard.name} detected, but it exposes no writable vendor interface — Chrome blocks reports on its keyboard collection.`
@@ -389,13 +420,19 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
       try {
         if (!configDevice.opened) await configDevice.open();
       } catch (err) {
-        rawHidRef.current = null;
+        viaTransportRef.current?.dispose();
+        viaTransportRef.current = null;
         showToast(err instanceof Error ? err.message : 'Could not open the HID interface.');
         return;
       }
 
-      rawHidRef.current = configDevice;
       const probe = await probeViaBoard(configDevice);
+
+      // A live VIA transport is the only thing allowed to write to the board.
+      viaTransportRef.current?.dispose();
+      viaTransportRef.current = probe.responded
+        ? new ViaTransport(configDevice, { onCommand: logBoardFrame })
+        : null;
 
       setDetectedKeyboards((prev) => prev.map((k) => (k.id === keyboard.id ? { ...k, probe } : k)));
       setDevice(buildConnectedDeviceInfo(keyboard, probe));
@@ -420,7 +457,7 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
         );
       }
     },
-    [appendPacket, showToast]
+    [appendPacket, logBoardFrame, showToast]
   );
 
   const rescanKeyboards = useCallback(async () => {
@@ -497,11 +534,21 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
     });
   }, [webHidSupported, rescanKeyboards]);
 
+  // If the board we are writing to disappears, drop the transport so no later
+  // write targets a device that is no longer there.
+  useEffect(() => {
+    if (device.connectionMode !== 'webhid' || detecting) return;
+    if (detectedKeyboards.some((k) => k.id === device.id)) return;
+    viaTransportRef.current?.dispose();
+    viaTransportRef.current = null;
+  }, [detectedKeyboards, device.id, device.connectionMode, detecting]);
+
   const selectSimulatorDevice = useCallback(
     (deviceId: string) => {
       const found = SIMULATOR_DEVICES.find((d) => d.id === deviceId);
       if (!found) return;
-      rawHidRef.current = null;
+      viaTransportRef.current?.dispose();
+      viaTransportRef.current = null;
       setDevice(found);
       setActiveProfile((prev) => ({ ...prev, formFactor: found.formFactor }));
       appendPacket('SIMULATOR_MOUNT_BOARD', 0x03, [
@@ -541,9 +588,27 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
       return updated;
     });
     setHasUnsavedChanges(false);
-    await appendPacket('FLASH_COMMIT_WORKSPACE', 0xff, [0x01, 0xaa, 0x55]);
-    showToast(`Saved "${activeProfile.name}" to keyboard flash & browser storage`);
-  }, [activeProfile, appendPacket, showToast]);
+
+    const transport = viaTransportRef.current;
+    if (!transport) {
+      showToast(
+        `Saved "${activeProfile.name}" to browser storage only. Connect a writable VIA board to push settings to hardware.`
+      );
+      return;
+    }
+
+    try {
+      const report = await pushLighting(transport, activeProfile.lighting);
+      const summary = summariseLightingReport(report);
+      showToast(`"${activeProfile.name}" — ${summary}`);
+    } catch (err) {
+      showToast(
+        `Saved "${activeProfile.name}" locally, but the board write failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`
+      );
+    }
+  }, [activeProfile, showToast]);
 
   const discardPendingChanges = useCallback(() => {
     setActiveProfile(savedProfileSnapshotRef.current);
@@ -1069,6 +1134,11 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
     showToast('Reset hardware test counters & chatter telemetry');
   }, [showToast]);
 
+  // A board is writable only when it is the active device AND it answered VIA.
+  const writableBoardConnected =
+    device.connectionMode === 'webhid' &&
+    (detectedKeyboards.find((k) => k.id === device.id)?.probe?.responded ?? false);
+
   return (
     <KeyboardContext.Provider
       value={{
@@ -1086,6 +1156,7 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
         detecting,
         rescanKeyboards,
         useDetectedKeyboard,
+        writableBoardConnected,
         packetLogs,
         clearPacketLogs,
         profiles,

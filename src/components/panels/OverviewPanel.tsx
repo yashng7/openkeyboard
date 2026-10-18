@@ -119,8 +119,10 @@ export function OverviewPanel() {
                       interface{kb.interfaces.length === 1 ? '' : 's'}
                     </div>
                     <div className="detected-tags">
-                      {kb.isConfigurable ? (
-                        <span className="pill-badge badge-live">Writable</span>
+                      {probe?.responded ? (
+                        <span className="pill-badge badge-live">Writable via VIA</span>
+                      ) : kb.isConfigurable ? (
+                        <span className="pill-badge badge-neutral">Vendor HID · unverified</span>
                       ) : (
                         <span className="pill-badge badge-neutral">Read-only</span>
                       )}
@@ -131,6 +133,9 @@ export function OverviewPanel() {
                         </span>
                       ) : (
                         <span className="pill-badge badge-neutral">Unverified</span>
+                      )}
+                      {probe?.responded && probe.lightingChannel !== null && (
+                        <span className="pill-badge badge-live">RGB</span>
                       )}
                       {kb.formFactorSource === 'vendor-default' && (
                         <span className="pill-badge badge-neutral">Size guessed</span>
@@ -302,7 +307,8 @@ export function OverviewPanel() {
               <span className="pill-badge badge-neutral">{packetLogs.length} Frames</span>
             </div>
             <p className="card-subtitle">
-              Real-time 32-byte vendor HID feature/output reports (`0xA0` framing + CRC checksum) dispatched to the board.
+              Frames are shown as a staging preview. When a VIA board is connected, real commands are
+              sent as 32-byte reports on report ID 0 and replies are logged as they arrive.
             </p>
           </div>
           <button type="button" className="btn-secondary" onClick={clearPacketLogs}>
