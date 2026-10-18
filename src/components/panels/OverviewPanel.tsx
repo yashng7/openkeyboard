@@ -27,6 +27,10 @@ export function OverviewPanel() {
     device,
     connectWebHidDevice,
     selectSimulatorDevice,
+    detectedKeyboards,
+    detecting,
+    rescanKeyboards,
+    useDetectedKeyboard,
     activeProfile,
     setPollingRate,
     setSystemMode,
@@ -68,6 +72,76 @@ export function OverviewPanel() {
             </span>
           </div>
         )}
+
+        <div className="simulator-selector-block">
+          <div className="detected-header">
+            <div>
+              <span className="section-micro-label">Detected Physical Keyboards</span>
+              <p className="card-subtitle">
+                Read from <code>navigator.hid.getDevices()</code> — only boards you already authorised for this
+                origin. WebHID has no enumerate-everything API, so unauthorised boards need one click to pair.
+              </p>
+            </div>
+            <button type="button" className="btn-secondary" onClick={rescanKeyboards} disabled={detecting}>
+              <RefreshCw size={15} className={detecting ? 'spin-icon' : undefined} />
+              <span>{detecting ? 'Scanning…' : 'Scan Again'}</span>
+            </button>
+          </div>
+
+          {detectedKeyboards.length === 0 ? (
+            <div className="notice-banner">
+              <span>
+                {webHidSupported
+                  ? 'No previously-authorised keyboard found. Click “Connect WebHID Keyboard” to grant access to one.'
+                  : 'Keyboard detection needs WebHID — Chrome, Edge, Brave or Opera over HTTPS/localhost.'}
+              </span>
+            </div>
+          ) : (
+            <div className="simulator-cards-row">
+              {detectedKeyboards.map((kb) => {
+                const isCurrent = device.id === kb.id;
+                const probe = kb.probe;
+                return (
+                  <button
+                    key={kb.id}
+                    type="button"
+                    className={`sim-device-btn ${isCurrent ? 'active' : ''}`}
+                    onClick={() => useDetectedKeyboard(kb.id)}
+                  >
+                    <div className="sim-device-top">
+                      <span className="sim-vendor">{kb.vendorName}</span>
+                      <span className="sim-ff">{kb.formFactor.toUpperCase()}</span>
+                    </div>
+                    <div className="sim-name">{kb.name}</div>
+                    <div className="sim-switch">
+                      0x{kb.vendorId.toString(16).padStart(4, '0').toUpperCase()}:0x
+                      {kb.productId.toString(16).padStart(4, '0').toUpperCase()} · {kb.interfaces.length}{' '}
+                      interface{kb.interfaces.length === 1 ? '' : 's'}
+                    </div>
+                    <div className="detected-tags">
+                      {kb.isConfigurable ? (
+                        <span className="pill-badge badge-live">Writable</span>
+                      ) : (
+                        <span className="pill-badge badge-neutral">Read-only</span>
+                      )}
+                      {probe?.responded ? (
+                        <span className="pill-badge badge-live">
+                          VIA {probe.protocolMajor}.{probe.protocolMinor}
+                          {probe.layerCount !== null ? ` · ${probe.layerCount}L` : ''}
+                        </span>
+                      ) : (
+                        <span className="pill-badge badge-neutral">Unverified</span>
+                      )}
+                      {kb.formFactorSource === 'vendor-default' && (
+                        <span className="pill-badge badge-neutral">Size guessed</span>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
         <div className="simulator-selector-block">
           <span className="section-micro-label">Interactive Virtual Hardware Models</span>
@@ -265,6 +339,10 @@ export function OverviewPanel() {
                       {pkt.status === 'confirmed' ? (
                         <>
                           <ShieldCheck size={12} /> WebHID ACK
+                        </>
+                      ) : pkt.status === 'error' ? (
+                        <>
+                          <ShieldCheck size={12} /> Rejected
                         </>
                       ) : (
                         <>

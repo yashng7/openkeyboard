@@ -117,6 +117,7 @@ export interface HidPacketLog {
   reportId: number;
   hexBytes: string;
   status: 'confirmed' | 'simulated' | 'error';
+  error?: string;
 }
 
 export interface ConnectedDeviceInfo {
@@ -126,7 +127,7 @@ export interface ConnectedDeviceInfo {
   vendorId: number;
   productId: number;
   connectionMode: 'webhid' | 'simulator';
-  transport: 'USB-C Wired (8K)' | '2.4GHz Dongle (4K)' | 'Bluetooth 5.3';
+  transport: 'USB-C Wired (8K)' | '2.4GHz Dongle (4K)' | 'Bluetooth 5.3' | 'USB Wired (rate unknown)';
   firmwareVersion: string;
   pcbSensor: string;
   switchType: string;
@@ -134,6 +135,64 @@ export interface ConnectedDeviceInfo {
   charging: boolean;
   formFactor: FormFactor;
   supportsMagnetic: boolean;
+}
+
+/**
+ * How a given HID interface (top-level collection) is being used by the board.
+ * Chrome exposes one HIDDevice per interface, so a physical keyboard normally
+ * shows up as several entries sharing the same vendorId/productId.
+ */
+export type HidInterfaceKind =
+  | 'via_raw_hid' // QMK/VIA raw HID (usage page 0xFF60, usage 0x61) — configurable
+  | 'vendor_defined' // Vendor usage page (>= 0xFF00) — may be configurable
+  | 'boot_keyboard' // Generic desktop / keyboard — reports blocked by Chrome
+  | 'mouse' // Generic desktop / mouse — reports blocked by Chrome
+  | 'consumer_control' // Consumer control (media keys) — reports blocked by Chrome
+  | 'unknown';
+
+export interface DetectedInterface {
+  kind: HidInterfaceKind;
+  label: string;
+  usagePage: number | null;
+  usage: number | null;
+  /** Report ID to use for sendReport(), taken from the device's report descriptor. */
+  outputReportId: number;
+  /** True when Chrome refuses to send/receive reports on this collection. */
+  protectedCollection: boolean;
+  /** True when OpenKeyboard can legitimately talk to this interface. */
+  configurable: boolean;
+}
+
+export interface ViaProbeResult {
+  /** A real reply came back from the board. */
+  responded: boolean;
+  protocolMajor: number | null;
+  protocolMinor: number | null;
+  firmwareVersion: number | null;
+  layerCount: number | null;
+  error?: string;
+}
+
+export interface DetectedKeyboard {
+  /** Physical device identity (one physical board = one entry). */
+  id: string;
+  name: string;
+  vendorName: string;
+  vendorId: number;
+  productId: number;
+  formFactor: FormFactor;
+  /** Which form factor matched, or whether it was guessed/fallback. */
+  formFactorSource: 'name-match' | 'vendor-default';
+  interfaces: DetectedInterface[];
+  /** Index into `interfaces` of the writable config interface, if any. */
+  configInterfaceIndex: number | null;
+  isConfigurable: boolean;
+  /** Vendor is on the known Hall-effect / magnetic board list. */
+  knownMagneticVendor: boolean;
+  /** Result of the live VIA handshake, when the board answered. */
+  probe: ViaProbeResult | null;
+  /** True when access was already granted (found via getDevices()). */
+  previouslyGranted: boolean;
 }
 
 export interface KeyboardProfile {

@@ -3,6 +3,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import {
   ConnectedDeviceInfo,
+  DetectedKeyboard,
   FormFactor,
   HidPacketLog,
   JevAdvisorDecisionResponse,
@@ -14,6 +15,7 @@ import {
   SocdPair,
   SwitchSoundProfile,
   ThemeMode,
+  ViaProbeResult,
   WorkspaceTab,
 } from '@/types/keyboard';
 import {
@@ -25,9 +27,17 @@ import {
 import {
   dispatchHidPacket,
   isWebHidSupported,
-  requestWebHidKeyboard,
   WebHidDevice,
 } from '@/lib/webhid-engine';
+import {
+  checkWebHidSupport,
+  findConfigDevice,
+  getGrantedInterfaces,
+  groupInterfaces,
+  probeViaBoard,
+  requestInterfaces,
+  subscribeToHidHotplug,
+} from '@/lib/hid-detect';
 import { playSwitchSound } from '@/lib/sound-engine';
 
 export interface ChatterEvent {
@@ -51,6 +61,14 @@ interface KeyboardContextValue {
   device: ConnectedDeviceInfo;
   connectWebHidDevice: () => Promise<void>;
   selectSimulatorDevice: (deviceId: string) => void;
+  /** Interfaces/keyboards this origin can see, grouped per physical board. */
+  detectedKeyboards: DetectedKeyboard[];
+  /** True while a scan/pair/probe is in flight. */
+  detecting: boolean;
+  /** Re-runs navigator.hid.getDevices() without prompting the user. */
+  rescanKeyboards: () => Promise<void>;
+  /** Opens the config interface of a detected board and probes it. */
+  useDetectedKeyboard: (keyboardId: string) => Promise<void>;
   packetLogs: HidPacketLog[];
   clearPacketLogs: () => void;
 
@@ -130,6 +148,41 @@ const KeyboardContext = createContext<KeyboardContextValue | null>(null);
 const STORAGE_KEY_PROFILES = 'openkeyboard_profiles_v1';
 const STORAGE_KEY_THEME = 'openkeyboard_theme_v1';
 
+/**
+ * Builds the UI's device identity from what the board actually reported.
+ * Anything we could not confirm is left explicitly unknown rather than invented.
+ */
+function buildConnectedDeviceInfo(
+  keyboard: DetectedKeyboard,
+  probe: ViaProbeResult | null
+): ConnectedDeviceInfo {
+  const firmwareVersion =
+    probe?.responded && probe.firmwareVersion !== null
+      ? `0x${probe.firmwareVersion.toString(16).padStart(8, '0').toUpperCase()}`
+      : probe?.responded
+        ? `VIA ${probe.protocolMajor}.${probe.protocolMinor}`
+        : 'Unreported';
+
+  return {
+    id: keyboard.id,
+    name: keyboard.name,
+    vendorName: keyboard.vendorName,
+    vendorId: keyboard.vendorId,
+    productId: keyboard.productId,
+    connectionMode: 'webhid',
+    transport: 'USB Wired (rate unknown)',
+    firmwareVersion,
+    pcbSensor: probe?.responded ? 'VIA/QMK raw HID (verified)' : 'Vendor HID (unverified)',
+    switchType: keyboard.knownMagneticVendor
+      ? 'Hall-effect / magnetic (vendor-listed)'
+      : 'Unverified switch type',
+    batteryPercent: null,
+    charging: false,
+    formFactor: keyboard.formFactor,
+    supportsMagnetic: keyboard.knownMagneticVendor,
+  };
+}
+
 export function KeyboardProvider({ children }: { children: React.ReactNode }) {
   const [theme, setThemeState] = useState<ThemeMode>('dark');
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('overview');
@@ -139,6 +192,8 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
   const [device, setDevice] = useState<ConnectedDeviceInfo>(SIMULATOR_DEVICES[1]); // Default Keychron Q1 HE 75%
   const rawHidRef = useRef<WebHidDevice | null>(null);
   const [packetLogs, setPacketLogs] = useState<HidPacketLog[]>([]);
+  const [detectedKeyboards, setDetectedKeyboards] = useState<DetectedKeyboard[]>([]);
+  const [detecting, setDetecting] = useState(false);
 
   const [profiles, setProfiles] = useState<KeyboardProfile[]>(PRESET_PROFILES);
   const [activeProfile, setActiveProfile] = useState<KeyboardProfile>(() => createDefaultProfile());
@@ -302,23 +357,145 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
     };
   }, [chatterThresholdMs]);
 
-  const connectWebHidDevice = useCallback(async () => {
-    try {
-      const res = await requestWebHidKeyboard();
-      if (!res) return;
-      rawHidRef.current = res.rawDevice;
-      setDevice(res.info);
+  // Map of keyboardId -> raw HID interfaces, needed to open the config collection later.
+  const hidInterfacesRef = useRef<Map<string, WebHidDevice[]>>(new Map());
+
+  const rememberInterfaces = useCallback((interfaces: WebHidDevice[]) => {
+    const map = new Map<string, WebHidDevice[]>();
+    for (const iface of interfaces) {
+      const id = `webhid-${iface.vendorId}-${iface.productId}`;
+      const list = map.get(id) ?? [];
+      list.push(iface);
+      map.set(id, list);
+    }
+    hidInterfacesRef.current = map;
+    return map;
+  }, []);
+
+  const activateDetectedKeyboard = useCallback(
+    async (keyboard: DetectedKeyboard) => {
+      const interfaces = hidInterfacesRef.current.get(keyboard.id) ?? [];
+      const configDevice = findConfigDevice(interfaces);
+
+      if (!configDevice) {
+        rawHidRef.current = null;
+        setDevice(buildConnectedDeviceInfo(keyboard, null));
+        showToast(
+          `${keyboard.name} detected, but it exposes no writable vendor interface — Chrome blocks reports on its keyboard collection.`
+        );
+        return;
+      }
+
+      try {
+        if (!configDevice.opened) await configDevice.open();
+      } catch (err) {
+        rawHidRef.current = null;
+        showToast(err instanceof Error ? err.message : 'Could not open the HID interface.');
+        return;
+      }
+
+      rawHidRef.current = configDevice;
+      const probe = await probeViaBoard(configDevice);
+
+      setDetectedKeyboards((prev) => prev.map((k) => (k.id === keyboard.id ? { ...k, probe } : k)));
+      setDevice(buildConnectedDeviceInfo(keyboard, probe));
+      setActiveProfile((prev) => ({ ...prev, formFactor: keyboard.formFactor }));
+
       await appendPacket('WEBHID_DEVICE_OPEN', 0x02, [
-        (res.info.vendorId >> 8) & 0xff,
-        res.info.vendorId & 0xff,
-        (res.info.productId >> 8) & 0xff,
-        res.info.productId & 0xff,
+        (keyboard.vendorId >> 8) & 0xff,
+        keyboard.vendorId & 0xff,
+        (keyboard.productId >> 8) & 0xff,
+        keyboard.productId & 0xff,
       ]);
-      showToast(`Connected to ${res.info.name} via WebHID`);
+      await appendPacket('VIA_GET_PROTOCOL_VERSION', 0x01, [0x01]);
+
+      if (probe.responded) {
+        const layers = probe.layerCount !== null ? `, ${probe.layerCount} layers` : '';
+        showToast(
+          `${keyboard.name} connected — VIA protocol ${probe.protocolMajor}.${probe.protocolMinor}${layers}`
+        );
+      } else {
+        showToast(
+          `${keyboard.name} connected, but it did not answer the VIA handshake. Treat its settings as unverified.`
+        );
+      }
+    },
+    [appendPacket, showToast]
+  );
+
+  const rescanKeyboards = useCallback(async () => {
+    if (!checkWebHidSupport().supported) {
+      setDetectedKeyboards([]);
+      return;
+    }
+    setDetecting(true);
+    try {
+      const interfaces = await getGrantedInterfaces();
+      rememberInterfaces(interfaces);
+      setDetectedKeyboards(groupInterfaces(interfaces, true));
+    } finally {
+      setDetecting(false);
+    }
+  }, [rememberInterfaces]);
+
+  const useDetectedKeyboard = useCallback(
+    async (keyboardId: string) => {
+      const found = detectedKeyboards.find((k) => k.id === keyboardId);
+      if (found) await activateDetectedKeyboard(found);
+    },
+    [activateDetectedKeyboard, detectedKeyboards]
+  );
+
+  const connectWebHidDevice = useCallback(async () => {
+    if (!checkWebHidSupport().supported) {
+      showToast(checkWebHidSupport().reason ?? 'WebHID is unavailable in this browser.');
+      return;
+    }
+    setDetecting(true);
+    try {
+      const interfaces = await requestInterfaces();
+      if (interfaces.length === 0) return;
+      rememberInterfaces(interfaces);
+      const boards = groupInterfaces(interfaces, false);
+      setDetectedKeyboards(boards);
+      const target = boards.find((b) => b.isConfigurable) ?? boards[0];
+      if (target) await activateDetectedKeyboard(target);
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to open WebHID device');
+    } finally {
+      setDetecting(false);
     }
-  }, [appendPacket, showToast]);
+  }, [activateDetectedKeyboard, rememberInterfaces, showToast]);
+
+  const bootScannedRef = useRef(false);
+
+  // Auto-detect on load. getDevices() needs no prompt, but only returns boards
+  // the user already granted this origin — WebHID has no enumerate-all API.
+  useEffect(() => {
+    if (bootScannedRef.current) return;
+    bootScannedRef.current = true;
+
+    const support = checkWebHidSupport();
+    setWebHidSupported(support.supported);
+    if (!support.supported) return;
+
+    void (async () => {
+      const interfaces = await getGrantedInterfaces();
+      rememberInterfaces(interfaces);
+      const boards = groupInterfaces(interfaces, true);
+      setDetectedKeyboards(boards);
+      const target = boards.find((b) => b.isConfigurable);
+      if (target) await activateDetectedKeyboard(target);
+    })();
+  }, [activateDetectedKeyboard, rememberInterfaces]);
+
+  // Hotplug — only fires for devices already granted to this origin.
+  useEffect(() => {
+    if (!webHidSupported) return;
+    return subscribeToHidHotplug(() => {
+      void rescanKeyboards();
+    });
+  }, [webHidSupported, rescanKeyboards]);
 
   const selectSimulatorDevice = useCallback(
     (deviceId: string) => {
@@ -905,6 +1082,10 @@ export function KeyboardProvider({ children }: { children: React.ReactNode }) {
         device,
         connectWebHidDevice,
         selectSimulatorDevice,
+        detectedKeyboards,
+        detecting,
+        rescanKeyboards,
+        useDetectedKeyboard,
         packetLogs,
         clearPacketLogs,
         profiles,

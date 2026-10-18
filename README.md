@@ -24,6 +24,27 @@ Inspired by [OpenMouse-Project/openmouse](https://github.com/OpenMouse-Project/o
 6. **TypeSafe Jev-1.13 Smart Profile Advisor**:
    - Server-side Next.js API route (`/api/jev-advisor`) querying `typesafe/jev-1.13` across `choice`, `score`, and `noul` primitives to auto-calibrate actuation, Rapid Trigger, SOCD, and polling rate for any game or workflow.
 
+## Device detection
+
+WebHID has no "enumerate every HID device" API — by design, a page can only see
+devices the user has explicitly granted it. OpenKeyboard therefore:
+
+1. On load, calls `navigator.hid.getDevices()` and lists already-authorised
+   boards without prompting.
+2. Subscribes to `connect` / `disconnect` events, so hot-plugged boards that were
+   previously authorised appear immediately.
+3. Prompts through `navigator.hid.requestDevice()` (the *Connect WebHID
+   Keyboard* button) for boards that have never been paired.
+4. Groups the per-interface `HIDDevice` objects Chrome returns into physical
+   keyboards, and only ever talks to the vendor / VIA raw-HID collection —
+   Chrome blocks reports on the protected keyboard and mouse collections.
+5. Probes the VIA raw-HID interface with `id_get_protocol_version` (`0x01`) to
+   confirm the board is really there and read its protocol, firmware and layer
+   count.
+
+A board that exposes no vendor interface is reported as **read-only** rather
+than pretending settings were applied.
+
 ## Development
 
 ```bash
